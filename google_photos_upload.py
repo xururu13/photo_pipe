@@ -43,6 +43,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary",
+    "https://www.googleapis.com/auth/photoslibrary.readonly",
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
     "https://www.googleapis.com/auth/photoslibrary.sharing",
 ]
@@ -176,7 +177,7 @@ class GooglePhotosClient:
         headers = {
             "Authorization": f"Bearer {self.creds.token}",
             "Content-Type": "application/octet-stream",
-            "X-Goog-Upload-File-Name": filename,
+            "X-Goog-Upload-File-Name": filename.encode("utf-8"),
             "X-Goog-Upload-Protocol": "raw",
         }
 
@@ -194,14 +195,14 @@ class GooglePhotosClient:
             return None
 
     def add_to_album(self, upload_tokens: list[str], album_id: str,
-                     descriptions: list[str] | None = None) -> int:
+                     descriptions: list[str] | None = None) -> set[int]:
         """
         Создаёт media items из upload tokens и добавляет в альбом.
         Google Photos API позволяет до 50 items за один запрос.
-        Возвращает количество успешно добавленных.
+        Возвращает множество индексов успешно добавленных элементов.
         """
         self._refresh_if_needed()
-        success_count = 0
+        success_indices = set()
 
         # Разбиваем на батчи по 50
         for i in range(0, len(upload_tokens), 50):
@@ -228,14 +229,10 @@ class GooglePhotosClient:
 
             if resp.status_code == 200:
                 results = resp.json().get("newMediaItemResults", [])
-                for r in results:
+                for j, r in enumerate(results):
                     status = r.get("status", {})
-                    if status.get("message") == "Success":
-                        success_count += 1
-                    elif status.get("message") == "OK":
-                        success_count += 1
-                    elif status.get("code", -1) == 0:
-                        success_count += 1
+                    if status.get("message") in ("Success", "OK") or status.get("code", -1) == 0:
+                        success_indices.add(i + j)
                     else:
                         print(f"  ⚠️  Элемент не добавлен: {status}")
             else:
@@ -245,7 +242,7 @@ class GooglePhotosClient:
             if i + 50 < len(upload_tokens):
                 time.sleep(1)
 
-        return success_count
+        return success_indices
 
     def list_album_items(self, album_id: str) -> dict[str, dict]:
         """
@@ -297,21 +294,22 @@ class GooglePhotosClient:
 
 # ── Лог загруженных файлов ─────────────────────────────────────────────────
 
-def load_upload_log(export_dir: Path) -> set:
-    """Загружает список ранее загруженных файлов."""
+def load_upload_log(export_dir: Path) -> tuple[set, dict]:
+    """Загружает список ранее загруженных файлов и кеш альбомов."""
     log_path = export_dir / UPLOAD_LOG
     if log_path.exists():
         with open(log_path) as f:
             data = json.load(f)
-            return set(data.get("uploaded", []))
-    return set()
+            return set(data.get("uploaded", [])), data.get("albums", {})
+    return set(), {}
 
 
-def save_upload_log(export_dir: Path, uploaded: set):
-    """Сохраняет список загруженных файлов."""
+def save_upload_log(export_dir: Path, uploaded: set, albums: dict):
+    """Сохраняет список загруженных файлов и кеш альбомов."""
     log_path = export_dir / UPLOAD_LOG
     with open(log_path, "w") as f:
-        json.dump({"uploaded": sorted(uploaded)}, f, indent=2, ensure_ascii=False)
+        json.dump({"uploaded": sorted(uploaded), "albums": albums},
+                  f, indent=2, ensure_ascii=False)
 
 
 # ── Основная логика ────────────────────────────────────────────────────────
@@ -408,7 +406,8 @@ def prompt_duplicate(filepath: Path, remote_info: dict) -> str:
 
 def process_folder(client: GooglePhotosClient, folder: Path,
                    existing_albums: dict, uploaded_log: set,
-                   skip_existing: bool, dry_run: bool) -> tuple[int, int]:
+                   skip_existing: bool, dry_run: bool,
+                   can_read_library: bool = True) -> tuple[int, int]:
     """
     Обрабатывает одну подпапку: создаёт альбом, загружает фото.
     Возвращает (uploaded_count, skipped_count).
@@ -442,13 +441,17 @@ def process_folder(client: GooglePhotosClient, folder: Path,
         return 0, skipped
 
     # Создаём / находим альбом
+    album_existed = album_name in existing_albums
     album_id = client.get_or_create_album(album_name, existing_albums)
-    print(f"     Альбом: {'найден' if album_name in existing_albums else 'создан'}")
+    print(f"     Альбом: {'найден' if album_existed else 'создан'}")
 
     # Получаем содержимое альбома для проверки дубликатов
-    remote_items = client.list_album_items(album_id)
-    if remote_items:
-        print(f"     В альбоме уже {len(remote_items)} файлов")
+    if can_read_library:
+        remote_items = client.list_album_items(album_id)
+        if remote_items:
+            print(f"     В альбоме уже {len(remote_items)} файлов")
+    else:
+        remote_items = {}
 
     # Загружаем файлы
     upload_tokens = []
@@ -513,12 +516,13 @@ def process_folder(client: GooglePhotosClient, folder: Path,
 
     # Добавляем в альбом
     print(f"     📎 Добавляю {len(upload_tokens)} файлов в альбом...", end="", flush=True)
-    added = client.add_to_album(upload_tokens, album_id)
+    success_indices = client.add_to_album(upload_tokens, album_id)
+    added = len(success_indices)
     print(f" ✓ ({added} добавлено)")
 
-    # Обновляем лог
-    for f in uploaded_files:
-        uploaded_log.add(str(f))
+    # Обновляем лог — только успешно добавленные
+    for idx in success_indices:
+        uploaded_log.add(str(uploaded_files[idx]))
 
     return added, skipped
 
@@ -619,14 +623,28 @@ def main():
 
         # Получаем список существующих альбомов
         print("\n📋 Загружаю список существующих альбомов...")
-        existing_albums = client.list_albums()
-        print(f"   Найдено {len(existing_albums)} альбомов")
+        try:
+            existing_albums = client.list_albums()
+            print(f"   Найдено {len(existing_albums)} альбомов")
+            can_read_library = True
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                print("   ⚠️  Нет доступа на чтение (403). Приложение не верифицировано?")
+                print("   Продолжаю без проверки дубликатов — только загрузка.")
+                existing_albums = {}
+                can_read_library = False
+            else:
+                raise
     else:
         client = None
         existing_albums = {}
+        can_read_library = False
 
     # Загружаем лог
-    uploaded_log = load_upload_log(args.export_dir)
+    uploaded_log, cached_albums = load_upload_log(args.export_dir)
+    if cached_albums and not can_read_library:
+        existing_albums.update(cached_albums)
+        print(f"📝 Из кеша загружено {len(cached_albums)} альбомов")
     if uploaded_log:
         print(f"📝 В логе {len(uploaded_log)} ранее загруженных файлов")
 
@@ -637,14 +655,14 @@ def main():
     for folder in subfolders:
         uploaded, skipped = process_folder(
             client, folder, existing_albums, uploaded_log,
-            args.skip_existing, args.dry_run,
+            args.skip_existing, args.dry_run, can_read_library,
         )
         grand_uploaded += uploaded
         grand_skipped += skipped
 
     # Сохраняем лог
-    if not args.dry_run and grand_uploaded > 0:
-        save_upload_log(args.export_dir, uploaded_log)
+    if not args.dry_run:
+        save_upload_log(args.export_dir, uploaded_log, existing_albums)
 
     # Итоги
     print("\n" + "=" * 60)
