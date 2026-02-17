@@ -2,3 +2,4 @@ requests
 google-auth
 google-auth-oauthlib
 Pillow
+pytest
