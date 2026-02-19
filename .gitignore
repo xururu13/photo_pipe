@@ -6,3 +6,4 @@ __pycache__/
 token.json
 credentials.json
 .gphotos_uploaded.json
+test_img/
